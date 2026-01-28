@@ -15,7 +15,7 @@ import (
 
 func runImport(metaSvc *MetadataService, srcRoot, dstRoot string) {
 	start := time.Now()
-	jobs := make(chan FileJob, 50)
+	jobs := make(chan FileJob, 100)
 
 	go func() {
 		defer close(jobs)
@@ -27,8 +27,12 @@ func runImport(metaSvc *MetadataService, srcRoot, dstRoot string) {
 		//    Linear scanning is often faster or equivalent for these devices.
 		// 3. Performance: Current throughput is sufficient.
 		filepath.WalkDir(srcRoot, func(path string, d fs.DirEntry, err error) error {
-			if err != nil || d.IsDir() {
+			if err != nil {
 				logger.Warn("Skipping unreadable path", "path", path, "err", err)
+				return nil
+			}
+
+			if d.IsDir() {
 				return nil
 			}
 

@@ -1,6 +1,7 @@
 package exifdate
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -128,43 +129,46 @@ func extractString(data []byte, tagStartOffset int, count uint32, order binary.B
 		// It's an offset
 		strStart = int(order.Uint32(data[valueOffset : valueOffset+4]))
 	}
+	if strStart < 0 {
+		return ""
+	}
 
 	if strStart+int(count) > len(data) {
 		return ""
 	}
 
-	// Slice the raw bytes
 	raw := data[strStart : strStart+int(count)]
 
-	// Trim null terminator efficiently without allocation
-	// Date strings are fixed length (19 chars) + null usually.
-	if len(raw) > 0 && raw[len(raw)-1] == 0 {
-		raw = raw[:len(raw)-1]
+	if idx := bytes.IndexByte(raw, 0); idx != -1 {
+		raw = raw[:idx]
 	}
+
+	raw = bytes.TrimSpace(raw)
 
 	return string(raw)
 }
 
-func parseExifTime(s string) (time.Time, error) {
-	s = strings.TrimSpace(s)
-	s = strings.Trim(s, "\x00")
+var nativeLayouts = []string{
+	"2006:01:02 15:04:05",
+	"2006:01:02 15:04:05-07:00",
+	"2006:01:02 15:04:05+07:00",
+	"2006-01-02 15:04:05",
+	"2006-01-02 15:04:05-07:00",
+	"2006-01-02T15:04:05",
+}
 
+func parseExifTime(s string) (time.Time, error) {
 	if len(s) < 10 || strings.HasPrefix(s, "0000:00:00") || strings.HasPrefix(s, "    :  :  ") {
 		// This is NOT "Unsupported". It is just "No Date".
 		// We do NOT want to trigger ExifTool for this.
 		return time.Time{}, errors.New("date not set")
 	}
 
-	if t, err := time.ParseInLocation("2006:01:02 15:04:05", s, time.Local); err == nil {
-		return t, nil
-	}
-
-	if t, err := time.ParseInLocation("2006-01-02 15:04:05", s, time.Local); err == nil {
-		return t, nil
-	}
-
-	if t, err := time.ParseInLocation("2006-01-02T15:04:05", s, time.Local); err == nil {
-		return t, nil
+	for _, layout := range nativeLayouts {
+		t, err := time.ParseInLocation(layout, s, time.Local)
+		if err == nil {
+			return t, nil
+		}
 	}
 
 	return time.Time{}, fmt.Errorf("%w: unknown date format '%s'", ErrUnsupported, s)

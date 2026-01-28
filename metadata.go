@@ -11,6 +11,27 @@ import (
 	"github.com/levmv/exisort/exifdate"
 )
 
+var (
+	dateTags = []string{
+		"CreationDate",
+		"DateTimeOriginal",
+		"ContentCreateDate",
+		"CreateDate",
+		"MediaCreateDate",
+	}
+
+	dateLayouts = []string{
+		"2006:01:02 15:04:05-07:00",
+		"2006:01:02 15:04:05+07:00",
+		"2006:01:02 15:04:05",
+		"2006-01-02 15:04:05-07:00",
+		"2006-01-02 15:04:05+07:00",
+		"2006-01-02 15:04:05",
+		"2006:01:02 15:04:05.000",
+		"2006-01-02 15:04:05.000",
+	}
+)
+
 type MetadataService struct {
 	et *exiftool.Exiftool
 	mu sync.Mutex
@@ -69,18 +90,19 @@ func (s *MetadataService) fallbackExifTool(path string) (time.Time, bool) {
 
 	fileInfos := et.ExtractMetadata(path)
 
-	for _, fileInfo := range fileInfos {
-		if fileInfo.Err != nil {
-			continue
-		}
+	if len(fileInfos) == 0 || fileInfos[0].Err != nil {
+		return time.Time{}, false
+	}
 
-		keys := []string{"DateTimeOriginal", "CreateDate", "MediaCreateDate"}
+	fields := fileInfos[0].Fields
 
-		for _, key := range keys {
-			if dateStr, ok := fileInfo.Fields[key].(string); ok {
-				parsedTime, err := time.Parse("2006:01:02 15:04:05", dateStr)
-				if err == nil {
-					return parsedTime, true
+	for _, key := range dateTags {
+		if val, ok := fields[key]; ok {
+			if dateStr, ok := val.(string); ok {
+				for _, layout := range dateLayouts {
+					if parsedTime, err := time.Parse(layout, dateStr); err == nil {
+						return parsedTime, true
+					}
 				}
 			}
 		}

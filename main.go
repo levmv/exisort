@@ -4,7 +4,6 @@ import (
 	"flag"
 	"fmt"
 	"io/fs"
-	"log/slog"
 	"os"
 	"strings"
 	"time"
@@ -31,10 +30,7 @@ type FileJob struct {
 	Hash       uint64
 }
 
-var (
-	logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
-	config Config
-)
+var config Config
 
 func main() {
 	importCmd := flag.NewFlagSet("import", flag.ExitOnError)
@@ -73,7 +69,7 @@ func main() {
 		importCmd.Parse(os.Args[2:])
 		args := importCmd.Args()
 		if len(args) < 2 {
-			logger.Error("Import requires <source> <dest>")
+			log.Error("Import requires <source> <dest>")
 			os.Exit(1)
 		}
 		config = *cfgImport
@@ -82,17 +78,21 @@ func main() {
 			config.Action = "move"
 		}
 		parseExts(config.Extensions, *extsImp)
+
+		InitLogger(config.Verbose)
 		runImport(metaSvc, args[0], args[1])
 
 	case "clean":
 		cleanCmd.Parse(os.Args[2:])
 		args := cleanCmd.Args()
 		if len(args) < 1 {
-			logger.Error("Clean requires <target>")
+			log.Error("Clean requires <target>")
 			os.Exit(1)
 		}
 		config = *cfgClean
 		parseExts(config.Extensions, *extsClean)
+
+		InitLogger(config.Verbose)
 		runClean(args[0])
 	}
 }

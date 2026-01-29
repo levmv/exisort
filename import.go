@@ -28,7 +28,7 @@ func runImport(metaSvc *MetadataService, srcRoot, dstRoot string) {
 		// 3. Performance: Current throughput is sufficient.
 		filepath.WalkDir(srcRoot, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
-				logger.Warn("Skipping unreadable path", "path", path, "err", err)
+				log.Warn("Skipping path %s: %v", path, err)
 				return nil
 			}
 
@@ -43,13 +43,13 @@ func runImport(metaSvc *MetadataService, srcRoot, dstRoot string) {
 
 			info, err := d.Info()
 			if err != nil {
-				logger.Warn("Skipping file info", "path", path, "err", err)
+				log.Warn("Skipping file info for %s: %v", path, err)
 				return nil
 			}
 
 			f, err := os.Open(path)
 			if err != nil {
-				logger.Warn("Skipping file open", "path", path, "err", err)
+				log.Warn("Skipping file info for %s: %v", path, err)
 				return nil
 			}
 			defer f.Close()
@@ -84,7 +84,7 @@ func runImport(metaSvc *MetadataService, srcRoot, dstRoot string) {
 	}
 
 	if config.Verbose {
-		logger.Info("Import finished", "duration", time.Since(start))
+		log.Info("Import finished for %d", time.Since(start))
 	}
 }
 
@@ -170,7 +170,7 @@ func isFileIdentical(job FileJob, existingPath string) bool {
 
 func handleDuplicate(job FileJob) {
 	if config.Verbose {
-		logger.Info("Duplicate skipped", "file", filepath.Base(job.Path))
+		log.Action("SKIP", "%s (Duplicate)", job.Path)
 	}
 	// If Action is "Move", we must delete the source because the file
 	// is already safe at the destination.
@@ -181,17 +181,19 @@ func handleDuplicate(job FileJob) {
 
 func performTransfer(job FileJob, destPath string) {
 	if config.DryRun {
-		logger.Info("Would "+config.Action, "src", job.Path, "dest", destPath)
+		log.Action("DRY ", "%s -> %s", job.Path, destPath)
 		return
 	}
 
 	if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
-		logger.Error("Mkdir failed", "err", err)
+		log.Error("Mkdir failed for %s: %v", destPath, err)
 		return
 	}
 
 	var err error
+	tag := "COPY"
 	if config.Action == "move" {
+		tag = "MOVE"
 		if err = os.Rename(job.Path, destPath); err != nil {
 			if err = copyFile(job.Path, destPath); err == nil {
 				os.Remove(job.Path)
@@ -202,9 +204,9 @@ func performTransfer(job FileJob, destPath string) {
 	}
 
 	if err != nil {
-		logger.Error("IO Error", "src", job.Path, "err", err)
+		log.Error("IO Error %s: %v", job.Path, err)
 	} else if config.Verbose {
-		logger.Info("Processed", "file", filepath.Base(job.Path))
+		log.Action(tag, "%s -> %s", job.Path, destPath)
 	}
 }
 

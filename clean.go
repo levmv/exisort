@@ -35,7 +35,7 @@ func runClean(targetDir string) {
 	})
 
 	if config.Verbose {
-		logger.Info("Scan complete", "files", count, "duration", time.Since(start))
+		log.Info("Scan complete %d files, %d", count, time.Since(start))
 	}
 
 	// 2. Hash Phase (Only potential duplicates)
@@ -81,7 +81,7 @@ func cleanDuplicates(files []FileJob) {
 
 	for _, f := range toRemove {
 		if config.DryRun {
-			logger.Info("Would "+config.Action, "file", f.Path)
+			log.Action(config.Action, f.Path)
 			continue
 		}
 

@@ -1,7 +1,8 @@
 package main
 
 import (
-	"crypto"
+	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"hash/crc64"
@@ -13,8 +14,7 @@ import (
 	"time"
 )
 
-func runImport(metaSvc *MetadataService, srcRoot, dstRoot string) {
-	start := time.Now()
+func Run(ctx context.Context, metaSvc *MetadataService, srcRoot, dstRoot string) error {
 	jobs := make(chan FileJob, 100)
 
 	go func() {
@@ -37,7 +37,7 @@ func runImport(metaSvc *MetadataService, srcRoot, dstRoot string) {
 			}
 
 			ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(path), "."))
-			if !config.Extensions[ext] {
+			if !cfg.extMap[ext] {
 				return nil
 			}
 
@@ -54,41 +54,62 @@ func runImport(metaSvc *MetadataService, srcRoot, dstRoot string) {
 			}
 			defer f.Close()
 
-			// 1. Read Header (Fingerprint)
 			// We read up to 64KB to generate a "Short Hash" and validify file type.
 			head := make([]byte, 64*1024)
-			n, _ := io.ReadFull(f, head)
+			n, err := io.ReadFull(f, head)
+			if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+				log.Warn("Failed to read header %s: %v", path, err)
+				return nil
+			}
 			validHead := head[:n]
 
 			f.Seek(0, 0)
 
-			// 2. Extract Date (EXIF or Fallback)
+			// Extract Date (EXIF or Fallback)
 			date := metaSvc.GetTime(f, info)
 
 			hash := computeFingerprint(validHead, info.Size())
 
-			jobs <- FileJob{
+			stats.IncScanned()
+
+			select {
+			case <-ctx.Done():
+				return filepath.SkipAll
+			case jobs <- FileJob{
 				Path:       path,
 				Info:       info,
 				Date:       date,
 				SourceHead: validHead,
 				Hash:       hash,
+			}:
 			}
+
 			return nil
 		})
 	}()
 
-	for job := range jobs {
-		destPath := filepath.Join(dstRoot, formatPath(config.Format, job.Date, job.Path))
-		importOne(job, destPath)
-	}
+	c := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case job, ok := <-jobs:
+			if !ok {
+				return nil
+			}
 
-	if config.Verbose {
-		log.Info("Import finished for %d", time.Since(start))
+			destPath := filepath.Join(dstRoot, formatPath(cfg.Format, job.Date, job.Path))
+			c++
+			if c%20 == 0 {
+				log.Status("Scanned: %d | Processing: %s...", stats.FilesScanned.Load(), job.Path)
+			}
+
+			importOne(ctx, job, destPath)
+		}
 	}
 }
 
-func importOne(job FileJob, originalDest string) {
+func importOne(ctx context.Context, job FileJob, originalDest string) {
 	finalDest := originalDest
 
 	// 1. Resolve Conflicts & Detect Duplicates
@@ -101,9 +122,9 @@ func importOne(job FileJob, originalDest string) {
 		}
 
 		// Conflict handling based on config
-		if config.Conflict == "skip" {
+		if cfg.Conflict == "skip" {
 			return
-		} else if config.Conflict == "overwrite" {
+		} else if cfg.Conflict == "overwrite" {
 			// Do nothing, let it fall through to copy logic
 		} else {
 			// Mode: "rename" (Default)
@@ -160,7 +181,7 @@ func isFileIdentical(job FileJob, existingPath string) bool {
 		return false
 	}
 
-	if config.DeepCheck || config.Action == "move" {
+	if cfg.DeepCheck || cfg.Move {
 		fullMatch, _ := areFilesDeepIdentical(job.Path, existingPath)
 		return fullMatch
 	}
@@ -169,19 +190,28 @@ func isFileIdentical(job FileJob, existingPath string) bool {
 }
 
 func handleDuplicate(job FileJob) {
-	if config.Verbose {
-		log.Action("SKIP", "%s (Duplicate)", job.Path)
+	stats.IncDuplicate()
+
+	if cfg.DryRun {
+		log.Duplicate(job.Path)
+		// log.Action(tag.Dry(), "%s (Duplicate)", job.Path)
+		return
 	}
-	// If Action is "Move", we must delete the source because the file
-	// is already safe at the destination.
-	if config.Action == "move" && !config.DryRun {
-		os.Remove(job.Path)
+
+	if cfg.Move {
+		if err := os.Remove(job.Path); err != nil {
+			log.Error("Failed to delete duplicate source %s: %v", job.Path, err)
+			return
+		}
 	}
+	log.Duplicate(job.Path)
+	// log.Action(tag, "%s (Duplicate)", job.Path)
 }
 
 func performTransfer(job FileJob, destPath string) {
-	if config.DryRun {
-		log.Action("DRY ", "%s -> %s", job.Path, destPath)
+	if cfg.DryRun {
+		//	log.Action(tag.Dry(), "%s -> %s", job.Path, destPath)
+		log.Transfer(job.Path, destPath)
 		return
 	}
 
@@ -191,9 +221,7 @@ func performTransfer(job FileJob, destPath string) {
 	}
 
 	var err error
-	tag := "COPY"
-	if config.Action == "move" {
-		tag = "MOVE"
+	if cfg.Move {
 		if err = os.Rename(job.Path, destPath); err != nil {
 			if err = copyFile(job.Path, destPath); err == nil {
 				os.Remove(job.Path)
@@ -204,9 +232,13 @@ func performTransfer(job FileJob, destPath string) {
 	}
 
 	if err != nil {
+		stats.IncError()
 		log.Error("IO Error %s: %v", job.Path, err)
-	} else if config.Verbose {
-		log.Action(tag, "%s -> %s", job.Path, destPath)
+	} else {
+		stats.IncProcessed()
+		stats.AddBytes(job.Info.Size())
+		log.Transfer(job.Path, destPath)
+		// log.Action(tag, "%s -> %s", job.Path, destPath)
 	}
 }
 
@@ -272,7 +304,7 @@ func computeFullHash(path string) (string, error) {
 	}
 	defer f.Close()
 
-	h := crypto.SHA256.New()
+	h := sha256.New()
 
 	if _, err := io.Copy(h, f); err != nil {
 		return "", err

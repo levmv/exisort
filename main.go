@@ -15,15 +15,15 @@ import (
 
 type Config struct {
 	// Flags
-	Verbose    bool
-	DryRun     bool
-	Move       bool
-	DeepCheck  bool
-	Conflict   string
-	Format     string
-	Extensions string
+	Verbose   bool
+	DryRun    bool
+	Move      bool
+	DeepCheck bool
+	Conflict  string
+	Format    string
 
-	extMap map[string]bool
+	Extensions   map[string]bool
+	MinSizeBytes int64
 }
 
 var cfg Config
@@ -40,6 +40,9 @@ type FileJob struct {
 const defaultExtensions = "jpg,jpeg,png,heic,heif,mov,mp4,m4v,avi,arw,cr2,cr3,dng,nef"
 
 func main() {
+	var rawExts string
+	var rawSizeKB int64
+
 	flag.BoolVar(&cfg.Verbose, "v", false, "Verbose logging")
 	flag.BoolVar(&cfg.DryRun, "dry-run", false, "Simulate operations without changes")
 	flag.BoolVar(&cfg.Move, "move", false, "Move files instead of copying")
@@ -47,7 +50,9 @@ func main() {
 
 	flag.StringVar(&cfg.Conflict, "conflict", "rename", "Collision resolution: rename, skip, overwrite")
 	flag.StringVar(&cfg.Format, "format", "{year}/{year}-{month}/{year}{month}{day}_{hour}{min}{sec}.{ext}", "Naming format")
-	flag.StringVar(&cfg.Extensions, "extensions", defaultExtensions, "Comma-separated list of extensions to process")
+
+	flag.StringVar(&rawExts, "extensions", defaultExtensions, "Comma-separated list of extensions to process")
+	flag.Int64Var(&rawSizeKB, "min-size", 32, "Minimum file size in KB to process")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Exisort: The safe photo organizer.\n\n")
@@ -61,10 +66,11 @@ func main() {
 		flag.Usage()
 		os.Exit(1)
 	}
+	cfg.MinSizeBytes = rawSizeKB * 1024
 
-	cfg.extMap = make(map[string]bool)
-	for e := range strings.SplitSeq(cfg.Extensions, ",") {
-		cfg.extMap[strings.ToLower(strings.TrimSpace(e))] = true
+	cfg.Extensions = make(map[string]bool)
+	for e := range strings.SplitSeq(rawExts, ",") {
+		cfg.Extensions[strings.ToLower(strings.TrimSpace(e))] = true
 	}
 
 	InitLogger()

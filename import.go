@@ -19,73 +19,7 @@ func Run(ctx context.Context, metaSvc *MetadataService, srcRoot, dstRoot string)
 
 	go func() {
 		defer close(jobs)
-
-		// Decision: We use synchronous filepath.WalkDir instead of a parallel worker pool.
-		// Rationale:
-		// 1. Simplicity: The code is much easier to maintain.
-		// 2. IO Limits: Most sources (SD cards, HDDs) perform poorly with random concurrent reads.
-		//    Linear scanning is often faster or equivalent for these devices.
-		// 3. Performance: Current throughput is sufficient.
-		filepath.WalkDir(srcRoot, func(path string, d fs.DirEntry, err error) error {
-			if err != nil {
-				log.Warn("Skipping path %s: %v", path, err)
-				return nil
-			}
-
-			if d.IsDir() {
-				return nil
-			}
-
-			ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(path), "."))
-			if !cfg.extMap[ext] {
-				return nil
-			}
-
-			info, err := d.Info()
-			if err != nil {
-				log.Warn("Skipping file info for %s: %v", path, err)
-				return nil
-			}
-
-			f, err := os.Open(path)
-			if err != nil {
-				log.Warn("Skipping file info for %s: %v", path, err)
-				return nil
-			}
-			defer f.Close()
-
-			// We read up to 64KB to generate a "Short Hash" and validify file type.
-			head := make([]byte, 64*1024)
-			n, err := io.ReadFull(f, head)
-			if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
-				log.Warn("Failed to read header %s: %v", path, err)
-				return nil
-			}
-			validHead := head[:n]
-
-			f.Seek(0, 0)
-
-			// Extract Date (EXIF or Fallback)
-			date := metaSvc.GetTime(f, info)
-
-			hash := computeFingerprint(validHead, info.Size())
-
-			stats.IncScanned()
-
-			select {
-			case <-ctx.Done():
-				return filepath.SkipAll
-			case jobs <- FileJob{
-				Path:       path,
-				Info:       info,
-				Date:       date,
-				SourceHead: validHead,
-				Hash:       hash,
-			}:
-			}
-
-			return nil
-		})
+		scanSource(ctx, metaSvc, srcRoot, jobs)
 	}()
 
 	c := 0
@@ -107,6 +41,78 @@ func Run(ctx context.Context, metaSvc *MetadataService, srcRoot, dstRoot string)
 			importOne(ctx, job, destPath)
 		}
 	}
+}
+
+func scanSource(ctx context.Context, metaSvc *MetadataService, root string, jobs chan<- FileJob) {
+	// Decision: We use synchronous filepath.WalkDir instead of a parallel worker pool.
+	// It much simpler. And often not that slower especially on slow disks.
+	filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			log.Warn("Skipping path %s: %v", path, err)
+			return nil
+		}
+
+		if d.IsDir() {
+			return nil
+		}
+
+		ext := strings.ToLower(strings.TrimPrefix(filepath.Ext(path), "."))
+		if !cfg.Extensions[ext] {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			log.Warn("Skipping file info for %s: %v", path, err)
+			return nil
+		}
+
+		if info.Size() < cfg.MinSizeBytes {
+			if cfg.Verbose {
+				log.Warn("Skipping %s: too small (%d B)", path, info.Size())
+			}
+			return nil
+		}
+
+		f, err := os.Open(path)
+		if err != nil {
+			log.Warn("Skipping file info for %s: %v", path, err)
+			return nil
+		}
+		defer f.Close()
+
+		// We read up to 64KB to generate a "Short Hash" and validify file type.
+		head := make([]byte, 64*1024)
+		n, err := io.ReadFull(f, head)
+		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+			log.Warn("Failed to read header %s: %v", path, err)
+			return nil
+		}
+		validHead := head[:n]
+
+		f.Seek(0, 0)
+
+		// Extract Date (EXIF or Fallback)
+		date := metaSvc.GetTime(f, info)
+
+		hash := computeFingerprint(validHead, info.Size())
+
+		stats.IncScanned()
+
+		select {
+		case <-ctx.Done():
+			return filepath.SkipAll
+		case jobs <- FileJob{
+			Path:       path,
+			Info:       info,
+			Date:       date,
+			SourceHead: validHead,
+			Hash:       hash,
+		}:
+		}
+
+		return nil
+	})
 }
 
 func importOne(ctx context.Context, job FileJob, originalDest string) {
@@ -135,7 +141,7 @@ func importOne(ctx context.Context, job FileJob, originalDest string) {
 			base := strings.TrimSuffix(originalDest, ext)
 
 			// TODO: 16-char hex hash probably is too much. Maybe just got half of it?
-			hashedDest := fmt.Sprintf("%s_%016x%s", base, job.Hash, ext)
+			hashedDest := fmt.Sprintf("%s_%08x%s", base, job.Hash, ext)
 
 			if _, err := os.Stat(hashedDest); os.IsNotExist(err) {
 				// Slot is free!
@@ -152,10 +158,14 @@ func importOne(ctx context.Context, job FileJob, originalDest string) {
 				// Start counting: "Image_A1B2C3D4_1.jpg"
 				n := 1
 				for {
-					counterDest := fmt.Sprintf("%s_%s_%d%s", base, job.Hash, n, ext)
+					counterDest := fmt.Sprintf("%s_%08x_%d%s", base, job.Hash, n, ext)
 					if _, err := os.Stat(counterDest); os.IsNotExist(err) {
 						finalDest = counterDest
 						break
+					}
+					if isFileIdentical(job, counterDest) {
+						handleDuplicate(job)
+						return
 					}
 					n++
 				}
@@ -164,7 +174,7 @@ func importOne(ctx context.Context, job FileJob, originalDest string) {
 	}
 
 	// 2. Perform Copy/Move to the resolved finalDest
-	performTransfer(job, finalDest)
+	transferFile(job, finalDest)
 }
 
 func isFileIdentical(job FileJob, existingPath string) bool {
@@ -205,17 +215,16 @@ func handleDuplicate(job FileJob) {
 		}
 	}
 	log.Duplicate(job.Path)
-	// log.Action(tag, "%s (Duplicate)", job.Path)
 }
 
-func performTransfer(job FileJob, destPath string) {
+func transferFile(job FileJob, destPath string) {
 	if cfg.DryRun {
-		//	log.Action(tag.Dry(), "%s -> %s", job.Path, destPath)
 		log.Transfer(job.Path, destPath)
 		return
 	}
 
 	if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+		stats.IncError()
 		log.Error("Mkdir failed for %s: %v", destPath, err)
 		return
 	}
@@ -223,12 +232,12 @@ func performTransfer(job FileJob, destPath string) {
 	var err error
 	if cfg.Move {
 		if err = os.Rename(job.Path, destPath); err != nil {
-			if err = copyFile(job.Path, destPath); err == nil {
+			if err = copyFile(job.Path, destPath, job.Info); err == nil {
 				os.Remove(job.Path)
 			}
 		}
 	} else {
-		err = copyFile(job.Path, destPath)
+		err = copyFile(job.Path, destPath, job.Info)
 	}
 
 	if err != nil {
@@ -238,7 +247,6 @@ func performTransfer(job FileJob, destPath string) {
 		stats.IncProcessed()
 		stats.AddBytes(job.Info.Size())
 		log.Transfer(job.Path, destPath)
-		// log.Action(tag, "%s -> %s", job.Path, destPath)
 	}
 }
 
@@ -253,16 +261,7 @@ func areHeadersIdentical(destPath string, sourceHead []byte) bool {
 	destHead := make([]byte, len(sourceHead))
 	n, _ := io.ReadFull(f, destHead)
 
-	if n != len(sourceHead) {
-		return false
-	}
-
-	for i := 0; i < n; i++ {
-		if sourceHead[i] != destHead[i] {
-			return false
-		}
-	}
-	return true
+	return n == len(sourceHead) && string(destHead) == string(sourceHead)
 }
 
 func areFilesDeepIdentical(src, dst string) (bool, error) {
@@ -282,10 +281,8 @@ func areFilesDeepIdentical(src, dst string) (bool, error) {
 var crcTable = crc64.MakeTable(crc64.ISO)
 
 // computeFingerprint calculates a fast hash based on the file header and file size.
-// This is NOT a cryptographic hash; it is used for file differentiation in naming.
 func computeFingerprint(header []byte, size int64) uint64 {
 	h := crc64.New(crcTable)
-
 	h.Write(header)
 
 	var sizeBuf [8]byte
@@ -313,20 +310,28 @@ func computeFullHash(path string) (string, error) {
 }
 
 func formatPath(fmtStr string, t time.Time, path string) string {
+	_, file := filepath.Split(path)
+	ext := filepath.Ext(file)
+	name := strings.TrimSuffix(file, ext)
+	if len(ext) > 0 {
+		ext = ext[1:] // remove dot
+	}
+
+	// Use t.Format for everything. It's cleaner.
 	r := strings.NewReplacer(
-		"{year}", fmt.Sprintf("%04d", t.Year()),
-		"{month}", fmt.Sprintf("%02d", t.Month()),
-		"{day}", fmt.Sprintf("%02d", t.Day()),
-		"{hour}", fmt.Sprintf("%02d", t.Hour()),
-		"{min}", fmt.Sprintf("%02d", t.Minute()),
-		"{sec}", fmt.Sprintf("%02d", t.Second()),
-		"{filename}", strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)),
-		"{ext}", strings.TrimPrefix(filepath.Ext(path), "."),
+		"{year}", t.Format("2006"),
+		"{month}", t.Format("01"),
+		"{day}", t.Format("02"),
+		"{hour}", t.Format("15"),
+		"{min}", t.Format("04"),
+		"{sec}", t.Format("05"),
+		"{filename}", name,
+		"{ext}", ext,
 	)
 	return r.Replace(fmtStr)
 }
 
-func copyFile(src, dst string) error {
+func copyFile(src, dst string, srcInfo fs.FileInfo) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
@@ -339,6 +344,13 @@ func copyFile(src, dst string) error {
 	}
 	defer out.Close()
 
-	_, err = io.Copy(out, in)
-	return err
+	if _, err = io.Copy(out, in); err != nil {
+		return err
+	}
+
+	if err := os.Chtimes(dst, time.Now(), srcInfo.ModTime()); err != nil {
+		// log.Warn("Fail to upgrade file time: %v", err)
+	}
+
+	return nil
 }

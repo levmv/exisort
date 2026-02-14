@@ -28,6 +28,8 @@ type Config struct {
 
 var cfg Config
 
+var Version = "dev"
+
 // FileJob contains the "Fingerprint" of the source file
 type FileJob struct {
 	Path       string
@@ -61,6 +63,11 @@ func main() {
 	}
 
 	flag.Parse()
+
+	if flag.NArg() >= 1 && flag.Arg(0) == "version" {
+		fmt.Println("exisort", Version)
+		os.Exit(0)
+	}
 
 	if flag.NArg() < 2 {
 		flag.Usage()
